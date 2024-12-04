@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/go-logr/logr"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	dsciv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/dscinitialization/v1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/components"
@@ -38,6 +38,26 @@ var _ components.ComponentInterface = (*Workbenches)(nil)
 // +kubebuilder:object:generate=true
 type Workbenches struct {
 	components.Component `json:""`
+}
+
+func (w *Workbenches) Init(ctx context.Context, _ cluster.Platform) error {
+	log := logf.FromContext(ctx).WithName(ComponentName)
+
+	var imageParamMap = map[string]string{
+		"odh-notebook-controller-image":    "RELATED_IMAGE_ODH_NOTEBOOK_CONTROLLER_IMAGE",
+		"odh-kf-notebook-controller-image": "RELATED_IMAGE_ODH_KF_NOTEBOOK_CONTROLLER_IMAGE",
+	}
+
+	// for kf-notebook-controller image
+	if err := deploy.ApplyParams(notebookControllerPath, imageParamMap); err != nil {
+		log.Error(err, "failed to update image", "path", notebookControllerPath)
+	}
+	// for odh-notebook-controller image
+	if err := deploy.ApplyParams(kfnotebookControllerPath, imageParamMap); err != nil {
+		log.Error(err, "failed to update image", "path", kfnotebookControllerPath)
+	}
+
+	return nil
 }
 
 func (w *Workbenches) OverrideManifests(ctx context.Context, platform cluster.Platform) error {
@@ -90,14 +110,9 @@ func (w *Workbenches) GetComponentName() string {
 	return ComponentName
 }
 
-func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client, logger logr.Logger,
+func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client,
 	owner metav1.Object, dscispec *dsciv1.DSCInitializationSpec, platform cluster.Platform, _ bool) error {
-	l := w.ConfigComponentLogger(logger, ComponentName, dscispec)
-	var imageParamMap = map[string]string{
-		"odh-notebook-controller-image":    "RELATED_IMAGE_ODH_NOTEBOOK_CONTROLLER_IMAGE",
-		"odh-kf-notebook-controller-image": "RELATED_IMAGE_ODH_KF_NOTEBOOK_CONTROLLER_IMAGE",
-	}
-
+	l := logf.FromContext(ctx)
 	// Set default notebooks namespace
 	// Create rhods-notebooks namespace in managed platforms
 	enabled := w.GetManagementState() == operatorv1.Managed
@@ -109,7 +124,7 @@ func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client,
 				return err
 			}
 		}
-		if platform == cluster.SelfManagedRhods || platform == cluster.ManagedRhods {
+		if platform == cluster.SelfManagedRhoai || platform == cluster.ManagedRhoai {
 			// Intentionally leaving the ownership unset for this namespace.
 			// Specifying this label triggers its deletion when the operator is uninstalled.
 			_, err := cluster.CreateNamespace(ctx, cli, cluster.DefaultNotebooksNamespace, cluster.WithLabels(labels.ODH.OwnedNamespace, "true"))
@@ -124,24 +139,11 @@ func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client,
 		}
 	}
 
-	// Update image parameters for nbc
-	if enabled {
-		if (dscispec.DevFlags == nil || dscispec.DevFlags.ManifestsUri == "") && (w.DevFlags == nil || len(w.DevFlags.Manifests) == 0) {
-			// for kf-notebook-controller image
-			if err := deploy.ApplyParams(notebookControllerPath, imageParamMap); err != nil {
-				return fmt.Errorf("failed to update image %s: %w", notebookControllerPath, err)
-			}
-			// for odh-notebook-controller image
-			if err := deploy.ApplyParams(kfnotebookControllerPath, imageParamMap); err != nil {
-				return fmt.Errorf("failed to update image %s: %w", kfnotebookControllerPath, err)
-			}
-		}
-	}
 	if err := deploy.DeployManifestsFromPath(ctx, cli, owner,
 		notebookControllerPath,
 		dscispec.ApplicationsNamespace,
 		ComponentName, enabled); err != nil {
-		return fmt.Errorf("failed to apply manifetss %s: %w", notebookControllerPath, err)
+		return fmt.Errorf("failed to apply manifests %s: %w", notebookControllerPath, err)
 	}
 	l.WithValues("Path", notebookControllerPath).Info("apply manifests done notebook controller done")
 
@@ -149,7 +151,7 @@ func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client,
 		kfnotebookControllerPath,
 		dscispec.ApplicationsNamespace,
 		ComponentName, enabled); err != nil {
-		return fmt.Errorf("failed to apply manifetss %s: %w", kfnotebookControllerPath, err)
+		return fmt.Errorf("failed to apply manifests %s: %w", kfnotebookControllerPath, err)
 	}
 	l.WithValues("Path", kfnotebookControllerPath).Info("apply manifests done kf-notebook controller done")
 
@@ -169,7 +171,7 @@ func (w *Workbenches) ReconcileComponent(ctx context.Context, cli client.Client,
 	}
 
 	// CloudService Monitoring handling
-	if platform == cluster.ManagedRhods {
+	if platform == cluster.ManagedRhoai {
 		if err := w.UpdatePrometheusConfig(cli, l, enabled && monitoringEnabled, ComponentName); err != nil {
 			return err
 		}

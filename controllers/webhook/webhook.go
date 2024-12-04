@@ -1,3 +1,5 @@
+//go:build !nowebhook
+
 /*
 Copyright 2023.
 
@@ -21,11 +23,15 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/go-logr/logr"
+	operatorv1 "github.com/openshift/api/operator/v1"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -34,20 +40,44 @@ import (
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
 )
 
-var log = ctrl.Log.WithName("odh-controller-webhook")
-
 //+kubebuilder:webhook:path=/validate-opendatahub-io-v1,mutating=false,failurePolicy=fail,sideEffects=None,groups=datasciencecluster.opendatahub.io;dscinitialization.opendatahub.io,resources=datascienceclusters;dscinitializations,verbs=create;delete,versions=v1,name=operator.opendatahub.io,admissionReviewVersions=v1
 //nolint:lll
 
+// TODO: Get rid of platform in name, rename to ValidatingWebhook.
 type OpenDataHubValidatingWebhook struct {
 	Client  client.Client
 	Decoder *admission.Decoder
+	Name    string
+}
+
+func Init(mgr ctrl.Manager) {
+	(&OpenDataHubValidatingWebhook{
+		Client:  mgr.GetClient(),
+		Decoder: admission.NewDecoder(mgr.GetScheme()),
+		Name:    "ValidatingWebhook",
+	}).SetupWithManager(mgr)
+
+	(&DSCDefaulter{
+		Name: "DefaultingWebhook",
+	}).SetupWithManager(mgr)
+}
+
+// newLogConstructor creates a new logger constructor for a webhook.
+// It is based on the root controller-runtime logger witch is set in main.go
+// The purpose of it is to remove "admission" from the log name.
+func newLogConstructor(name string) func(logr.Logger, *admission.Request) logr.Logger {
+	return func(_ logr.Logger, req *admission.Request) logr.Logger {
+		base := ctrl.Log
+		l := admission.DefaultLogConstructor(base, req)
+		return l.WithValues("webhook", name)
+	}
 }
 
 func (w *OpenDataHubValidatingWebhook) SetupWithManager(mgr ctrl.Manager) {
 	hookServer := mgr.GetWebhookServer()
 	odhWebhook := &webhook.Admission{
-		Handler: w,
+		Handler:        w,
+		LogConstructor: newLogConstructor(w.Name),
 	}
 	hookServer.Register("/validate-opendatahub-io-v1", odhWebhook)
 }
@@ -77,6 +107,8 @@ func denyCountGtZero(ctx context.Context, cli client.Client, gvk schema.GroupVer
 }
 
 func (w *OpenDataHubValidatingWebhook) checkDupCreation(ctx context.Context, req admission.Request) admission.Response {
+	log := logf.FromContext(ctx)
+
 	switch req.Kind.Kind {
 	case "DataScienceCluster", "DSCInitialization":
 	default:
@@ -106,6 +138,9 @@ func (w *OpenDataHubValidatingWebhook) checkDeletion(ctx context.Context, req ad
 }
 
 func (w *OpenDataHubValidatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
+	log := logf.FromContext(ctx).WithName(w.Name).WithValues("operation", req.Operation)
+	ctx = logf.IntoContext(ctx, log)
+
 	var resp admission.Response
 	resp.Allowed = true // initialize Allowed to be true in case Operation falls into "default" case
 
@@ -128,42 +163,33 @@ func (w *OpenDataHubValidatingWebhook) Handle(ctx context.Context, req admission
 //+kubebuilder:webhook:path=/mutate-opendatahub-io-v1,mutating=true,failurePolicy=fail,sideEffects=None,groups=datasciencecluster.opendatahub.io,resources=datascienceclusters,verbs=create;update,versions=v1,name=mutate.operator.opendatahub.io,admissionReviewVersions=v1
 //nolint:lll
 
-// OpenDataHubMutatingWebhook is a mutating webhook
+type DSCDefaulter struct {
+	Name string
+}
+
+// just assert that DSCDefaulter implements webhook.CustomDefaulter.
+var _ webhook.CustomDefaulter = &DSCDefaulter{}
+
+func (m *DSCDefaulter) SetupWithManager(mgr ctrl.Manager) {
+	mutateWebhook := admission.WithCustomDefaulter(mgr.GetScheme(), &dscv1.DataScienceCluster{}, m)
+	mutateWebhook.LogConstructor = newLogConstructor(m.Name)
+	mgr.GetWebhookServer().Register("/mutate-opendatahub-io-v1", mutateWebhook)
+}
+
+// Implement admission.CustomDefaulter interface.
 // It currently only sets defaults for modelregiestry in datascienceclusters.
-type OpenDataHubMutatingWebhook struct {
-	Client  client.Client
-	Decoder *admission.Decoder
-}
-
-func (w *OpenDataHubMutatingWebhook) SetupWithManager(mgr ctrl.Manager) {
-	hookServer := mgr.GetWebhookServer()
-	odhWebhook := &webhook.Admission{
-		Handler: w,
+func (m *DSCDefaulter) Default(_ context.Context, obj runtime.Object) error {
+	// TODO: add debug logging, log := logf.FromContext(ctx).WithName(m.Name)
+	dsc, isDSC := obj.(*dscv1.DataScienceCluster)
+	if !isDSC {
+		return fmt.Errorf("expected DataScienceCluster but got a different type: %T", obj)
 	}
-	hookServer.Register("/mutate-opendatahub-io-v1", odhWebhook)
-}
 
-func (w *OpenDataHubMutatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
-	var resp admission.Response
-	resp.Allowed = true // initialize Allowed to be true in case Operation falls into "default" case
-
-	dsc := &dscv1.DataScienceCluster{}
-	err := w.Decoder.Decode(req, dsc)
-	if err != nil {
-		return admission.Denied(fmt.Sprintf("failed to decode request body: %s", err))
+	// set default registriesNamespace if empty "" but ModelRegistry is enabled
+	if dsc.Spec.Components.ModelRegistry.ManagementState == operatorv1.Managed {
+		if dsc.Spec.Components.ModelRegistry.RegistriesNamespace == "" {
+			dsc.Spec.Components.ModelRegistry.RegistriesNamespace = modelregistry.DefaultModelRegistriesNamespace
+		}
 	}
-	resp = w.setDSCDefaults(ctx, dsc)
-	return resp
-}
-
-func (w *OpenDataHubMutatingWebhook) setDSCDefaults(_ context.Context, dsc *dscv1.DataScienceCluster) admission.Response {
-	// set default registriesNamespace if empty
-	if len(dsc.Spec.Components.ModelRegistry.RegistriesNamespace) == 0 {
-		return admission.Patched("Property registriesNamespace set to default value", webhook.JSONPatchOp{
-			Operation: "replace",
-			Path:      "spec.components.modelregistry.registriesNamespace",
-			Value:     modelregistry.DefaultModelRegistriesNamespace,
-		})
-	}
-	return admission.Allowed("")
+	return nil
 }

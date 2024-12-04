@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -65,7 +66,6 @@ import (
 type DataScienceClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	Log    logr.Logger
 	// Recorder to generate events
 	Recorder           record.EventRecorder
 	DataScienceCluster *DataScienceClusterConfig
@@ -83,14 +83,14 @@ const (
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { //nolint:maintidx,gocyclo
-	r.Log.Info("Reconciling DataScienceCluster resources", "Request.Name", req.Name)
+	log := logf.FromContext(ctx).WithName("DataScienceCluster")
+	log.Info("Reconciling DataScienceCluster resources", "Request.Name", req.Name)
 
-	// Get information on version
-	currentOperatorReleaseVersion, err := cluster.GetRelease(ctx, r.Client)
-	if err != nil {
-		r.Log.Error(err, "failed to get operator release version")
-		return ctrl.Result{}, err
-	}
+	// Get information on version and platform
+	currentOperatorRelease := cluster.GetRelease()
+	// Set platform
+	platform := currentOperatorRelease.Name
+
 	instances := &dscv1.DataScienceClusterList{}
 
 	if err := r.Client.List(ctx, instances); err != nil {
@@ -103,7 +103,7 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// For additional cleanup logic use operatorUninstall function.
 		// Return and don't requeue
 		if upgrade.HasDeleteConfigMap(ctx, r.Client) {
-			if uninstallErr := upgrade.OperatorUninstall(ctx, r.Client); uninstallErr != nil {
+			if uninstallErr := upgrade.OperatorUninstall(ctx, r.Client, platform); uninstallErr != nil {
 				return ctrl.Result{}, fmt.Errorf("error while operator uninstall: %w", uninstallErr)
 			}
 		}
@@ -125,10 +125,10 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 		if controllerutil.ContainsFinalizer(instance, finalizerName) {
 			if controllerutil.RemoveFinalizer(instance, finalizerName) {
 				if err := r.Update(ctx, instance); err != nil {
-					r.Log.Info("Error to remove DSC finalizer", "error", err)
+					log.Info("Error to remove DSC finalizer", "error", err)
 					return ctrl.Result{}, err
 				}
-				r.Log.Info("Removed finalizer for DataScienceCluster", "name", instance.Name, "finalizer", finalizerName)
+				log.Info("Removed finalizer for DataScienceCluster", "name", instance.Name, "finalizer", finalizerName)
 			}
 		}
 		if err := r.Client.Delete(ctx, instance, []client.DeleteOption{}...); err != nil {
@@ -148,7 +148,7 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 	dsciInstances := &dsciv1.DSCInitializationList{}
 	err = r.Client.List(ctx, dsciInstances)
 	if err != nil {
-		r.Log.Error(err, "Failed to retrieve DSCInitialization resource.", "DSCInitialization Request.Name", req.Name)
+		log.Error(err, "Failed to retrieve DSCInitialization resource.", "DSCInitialization Request.Name", req.Name)
 		r.Recorder.Eventf(instance, corev1.EventTypeWarning, "DSCInitializationReconcileError", "Failed to retrieve DSCInitialization instance")
 
 		return ctrl.Result{}, err
@@ -159,7 +159,7 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 	case 0:
 		reason := status.ReconcileFailed
 		message := "Failed to get a valid DSCInitialization instance, please create a DSCI instance"
-		r.Log.Info(message)
+		log.Info(message)
 		instance, err = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dscv1.DataScienceCluster) {
 			status.SetProgressingCondition(&saved.Status.Conditions, reason, message)
 			// Patch Degraded with True status
@@ -167,7 +167,7 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 			saved.Status.Phase = status.PhaseError
 		})
 		if err != nil {
-			r.reportError(err, instance, "failed to update DataScienceCluster condition")
+			r.reportError(ctx, err, instance, "failed to update DataScienceCluster condition")
 
 			return ctrl.Result{}, err
 		}
@@ -179,14 +179,14 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
-			r.Log.Info("Adding finalizer for DataScienceCluster", "name", instance.Name, "finalizer", finalizerName)
+			log.Info("Adding finalizer for DataScienceCluster", "name", instance.Name, "finalizer", finalizerName)
 			controllerutil.AddFinalizer(instance, finalizerName)
 			if err := r.Update(ctx, instance); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 	} else {
-		r.Log.Info("Finalization DataScienceCluster start deleting instance", "name", instance.Name, "finalizer", finalizerName)
+		log.Info("Finalization DataScienceCluster start deleting instance", "name", instance.Name, "finalizer", finalizerName)
 		for _, component := range allComponents {
 			if err := component.Cleanup(ctx, r.Client, instance, r.DataScienceCluster.DSCISpec); err != nil {
 				return ctrl.Result{}, err
@@ -228,10 +228,10 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 		instance, err = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dscv1.DataScienceCluster) {
 			status.SetProgressingCondition(&saved.Status.Conditions, reason, message)
 			saved.Status.Phase = status.PhaseProgressing
-			saved.Status.Release = currentOperatorReleaseVersion
+			saved.Status.Release = currentOperatorRelease
 		})
 		if err != nil {
-			_ = r.reportError(err, instance, fmt.Sprintf("failed to add conditions to status of DataScienceCluster resource name %s", req.Name))
+			_ = r.reportError(ctx, err, instance, fmt.Sprintf("failed to add conditions to status of DataScienceCluster resource name %s", req.Name))
 
 			return ctrl.Result{}, err
 		}
@@ -241,21 +241,22 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 	var componentErrors *multierror.Error
 
 	for _, component := range allComponents {
-		if instance, err = r.reconcileSubComponent(ctx, instance, component); err != nil {
+		if instance, err = r.reconcileSubComponent(ctx, instance, platform, component); err != nil {
 			componentErrors = multierror.Append(componentErrors, err)
 		}
 	}
 
 	// Process errors for components
 	if componentErrors != nil {
-		r.Log.Info("DataScienceCluster Deployment Incomplete.")
+		log.Info("DataScienceCluster Deployment Incomplete.")
 		instance, err = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dscv1.DataScienceCluster) {
 			status.SetCompleteCondition(&saved.Status.Conditions, status.ReconcileCompletedWithComponentErrors,
 				fmt.Sprintf("DataScienceCluster resource reconciled with component errors: %v", componentErrors))
 			saved.Status.Phase = status.PhaseReady
+			saved.Status.Release = currentOperatorRelease
 		})
 		if err != nil {
-			r.Log.Error(err, "failed to update DataScienceCluster conditions with incompleted reconciliation")
+			log.Error(err, "failed to update DataScienceCluster conditions with incompleted reconciliation")
 
 			return ctrl.Result{}, err
 		}
@@ -269,15 +270,16 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 	instance, err = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dscv1.DataScienceCluster) {
 		status.SetCompleteCondition(&saved.Status.Conditions, status.ReconcileCompleted, "DataScienceCluster resource reconciled successfully")
 		saved.Status.Phase = status.PhaseReady
+		saved.Status.Release = currentOperatorRelease
 	})
 
 	if err != nil {
-		r.Log.Error(err, "failed to update DataScienceCluster conditions after successfully completed reconciliation")
+		log.Error(err, "failed to update DataScienceCluster conditions after successfully completed reconciliation")
 
 		return ctrl.Result{}, err
 	}
 
-	r.Log.Info("DataScienceCluster Deployment Completed.")
+	log.Info("DataScienceCluster Deployment Completed.")
 	r.Recorder.Eventf(instance, corev1.EventTypeNormal, "DataScienceClusterCreationSuccessful",
 		"DataScienceCluster instance %s created and deployed successfully", instance.Name)
 
@@ -285,8 +287,9 @@ func (r *DataScienceClusterReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *DataScienceClusterReconciler) reconcileSubComponent(ctx context.Context, instance *dscv1.DataScienceCluster,
-	component components.ComponentInterface,
+	platform cluster.Platform, component components.ComponentInterface,
 ) (*dscv1.DataScienceCluster, error) {
+	log := logf.FromContext(ctx)
 	componentName := component.GetComponentName()
 
 	enabled := component.GetManagementState() == operatorv1.Managed
@@ -303,24 +306,19 @@ func (r *DataScienceClusterReconciler) reconcileSubComponent(ctx context.Context
 			status.SetComponentCondition(&saved.Status.Conditions, componentName, status.ReconcileInit, message, corev1.ConditionUnknown)
 		})
 		if err != nil {
-			_ = r.reportError(err, instance, "failed to update DataScienceCluster conditions before first time reconciling "+componentName)
+			_ = r.reportError(ctx, err, instance, "failed to update DataScienceCluster conditions before first time reconciling "+componentName)
 			// try to continue with reconciliation, as further updates can fix the status
 		}
 	}
 	// Reconcile component
-	// Get platform
-	platform, err := cluster.GetPlatform(ctx, r.Client)
-	if err != nil {
-		r.Log.Error(err, "Failed to determine platform")
-		return instance, err
-	}
-	err = component.ReconcileComponent(ctx, r.Client, r.Log, instance, r.DataScienceCluster.DSCISpec, platform, installedComponentValue)
+	componentCtx := newComponentContext(ctx, log, componentName)
+	err := component.ReconcileComponent(componentCtx, r.Client, instance, r.DataScienceCluster.DSCISpec, platform, installedComponentValue)
 
 	// TODO: replace this hack with a full refactor of component status in the future
 
 	if err != nil {
 		// reconciliation failed: log errors, raise event and update status accordingly
-		instance = r.reportError(err, instance, "failed to reconcile "+componentName+" on DataScienceCluster")
+		instance = r.reportError(ctx, err, instance, "failed to reconcile "+componentName+" on DataScienceCluster")
 		instance, _ = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dscv1.DataScienceCluster) {
 			if enabled {
 				if strings.Contains(err.Error(), datasciencepipelines.ArgoWorkflowCRD+" CRD already exists") {
@@ -356,7 +354,7 @@ func (r *DataScienceClusterReconciler) reconcileSubComponent(ctx context.Context
 		}
 	})
 	if err != nil {
-		instance = r.reportError(err, instance, "failed to update DataScienceCluster status after reconciling "+componentName)
+		instance = r.reportError(ctx, err, instance, "failed to update DataScienceCluster status after reconciling "+componentName)
 
 		return instance, err
 	}
@@ -364,8 +362,12 @@ func (r *DataScienceClusterReconciler) reconcileSubComponent(ctx context.Context
 	return instance, nil
 }
 
-func (r *DataScienceClusterReconciler) reportError(err error, instance *dscv1.DataScienceCluster, message string) *dscv1.DataScienceCluster {
-	r.Log.Error(err, message, "instance.Name", instance.Name)
+func newComponentContext(ctx context.Context, log logr.Logger, componentName string) context.Context {
+	return logf.IntoContext(ctx, log.WithName(componentName).WithValues("component", componentName))
+}
+
+func (r *DataScienceClusterReconciler) reportError(ctx context.Context, err error, instance *dscv1.DataScienceCluster, message string) *dscv1.DataScienceCluster {
+	logf.FromContext(ctx).Error(err, message, "instance.Name", instance.Name)
 	r.Recorder.Eventf(instance, corev1.EventTypeWarning, "DataScienceClusterReconcileError",
 		"%s for instance %s", message, instance.Name)
 	return instance
@@ -499,7 +501,7 @@ func (r *DataScienceClusterReconciler) SetupWithManager(ctx context.Context, mgr
 		Owns(&imagev1.ImageStream{}).
 		Owns(&buildv1.BuildConfig{}).
 		Owns(&apiregistrationv1.APIService{}).
-		Owns(&networkingv1.Ingress{}).
+		Owns(&operatorv1.IngressController{}).
 		Owns(&admissionregistrationv1.MutatingWebhookConfiguration{}).
 		Owns(
 			&admissionregistrationv1.ValidatingWebhookConfiguration{},

@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/go-logr/logr"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	dsciv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/dscinitialization/v1"
 	infrav1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/infrastructure/v1"
@@ -54,6 +54,23 @@ type Kserve struct {
 	// This field is optional. If no default deployment mode is specified, Kserve will use Serverless mode.
 	// +kubebuilder:validation:Enum=Serverless;RawDeployment
 	DefaultDeploymentMode DefaultDeploymentMode `json:"defaultDeploymentMode,omitempty"`
+	// Configures and enables NVIDIA NIM integration
+	NIM infrav1.NimSpec `json:"nim,omitempty"`
+}
+
+func (k *Kserve) Init(ctx context.Context, _ cluster.Platform) error {
+	log := logf.FromContext(ctx).WithName(ComponentName)
+
+	// dependentParamMap for odh-model-controller to use.
+	var dependentParamMap = map[string]string{
+		"odh-model-controller": "RELATED_IMAGE_ODH_MODEL_CONTROLLER_IMAGE",
+	}
+	// Update image parameters for odh-model-controller
+	if err := deploy.ApplyParams(DependentPath, dependentParamMap); err != nil {
+		log.Error(err, "failed to update image", "path", DependentPath)
+	}
+
+	return nil
 }
 
 func (k *Kserve) OverrideManifests(ctx context.Context, _ cluster.Platform) error {
@@ -95,18 +112,15 @@ func (k *Kserve) GetComponentName() string {
 }
 
 func (k *Kserve) ReconcileComponent(ctx context.Context, cli client.Client,
-	logger logr.Logger, owner metav1.Object, dscispec *dsciv1.DSCInitializationSpec, platform cluster.Platform, _ bool) error {
-	l := k.ConfigComponentLogger(logger, ComponentName, dscispec)
-
-	// dependentParamMap for odh-model-controller to use.
-	var dependentParamMap = map[string]string{
-		"odh-model-controller": "RELATED_IMAGE_ODH_MODEL_CONTROLLER_IMAGE",
-	}
-
+	owner metav1.Object, dscispec *dsciv1.DSCInitializationSpec, platform cluster.Platform, _ bool) error {
+	l := logf.FromContext(ctx)
 	enabled := k.GetManagementState() == operatorv1.Managed
 	monitoringEnabled := dscispec.Monitoring.ManagementState == operatorv1.Managed
 
 	if !enabled {
+		if err := deploy.ApplyParams(DependentPath, nil, map[string]string{"nim-state": "removed"}); err != nil {
+			return fmt.Errorf("failed to update NIM flag to removed : %w", err)
+		}
 		if err := k.removeServerlessFeatures(ctx, cli, owner, dscispec); err != nil {
 			return err
 		}
@@ -120,6 +134,12 @@ func (k *Kserve) ReconcileComponent(ctx context.Context, cli client.Client,
 			if err := k.OverrideManifests(ctx, platform); err != nil {
 				return err
 			}
+		}
+		extraParamsMap := map[string]string{
+			"nim-state": string(k.NIM.ManagementState),
+		}
+		if err := deploy.ApplyParams(DependentPath, nil, extraParamsMap); err != nil {
+			return fmt.Errorf("failed to update NIM flag from %s : %w", Path, err)
 		}
 	}
 
@@ -142,12 +162,6 @@ func (k *Kserve) ReconcileComponent(ctx context.Context, cli client.Client,
 		if err := cluster.UpdatePodSecurityRolebinding(ctx, cli, dscispec.ApplicationsNamespace, "odh-model-controller"); err != nil {
 			return err
 		}
-		// Update image parameters for odh-model-controller
-		if (dscispec.DevFlags == nil || dscispec.DevFlags.ManifestsUri == "") && (k.DevFlags == nil || len(k.DevFlags.Manifests) == 0) {
-			if err := deploy.ApplyParams(DependentPath, dependentParamMap); err != nil {
-				return fmt.Errorf("failed to update image %s: %w", DependentPath, err)
-			}
-		}
 	}
 
 	if err := deploy.DeployManifestsFromPath(ctx, cli, owner, DependentPath, dscispec.ApplicationsNamespace, ComponentName, enabled); err != nil {
@@ -166,7 +180,7 @@ func (k *Kserve) ReconcileComponent(ctx context.Context, cli client.Client,
 	}
 
 	// CloudService Monitoring handling
-	if platform == cluster.ManagedRhods {
+	if platform == cluster.ManagedRhoai {
 		// kesrve rules
 		if err := k.UpdatePrometheusConfig(cli, l, enabled && monitoringEnabled, ComponentName); err != nil {
 			return err

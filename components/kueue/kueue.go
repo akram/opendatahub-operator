@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/go-logr/logr"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	dsciv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/dscinitialization/v1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/components"
@@ -29,6 +29,20 @@ var _ components.ComponentInterface = (*Kueue)(nil)
 // +kubebuilder:object:generate=true
 type Kueue struct {
 	components.Component `json:""`
+}
+
+func (k *Kueue) Init(ctx context.Context, _ cluster.Platform) error {
+	log := logf.FromContext(ctx).WithName(ComponentName)
+
+	var imageParamMap = map[string]string{
+		"odh-kueue-controller-image": "RELATED_IMAGE_ODH_KUEUE_CONTROLLER_IMAGE", // new kueue image
+	}
+
+	if err := deploy.ApplyParams(Path, imageParamMap); err != nil {
+		log.Error(err, "failed to update image", "path", Path)
+	}
+
+	return nil
 }
 
 func (k *Kueue) OverrideManifests(ctx context.Context, _ cluster.Platform) error {
@@ -53,13 +67,9 @@ func (k *Kueue) GetComponentName() string {
 	return ComponentName
 }
 
-func (k *Kueue) ReconcileComponent(ctx context.Context, cli client.Client, logger logr.Logger,
+func (k *Kueue) ReconcileComponent(ctx context.Context, cli client.Client,
 	owner metav1.Object, dscispec *dsciv1.DSCInitializationSpec, platform cluster.Platform, _ bool) error {
-	l := k.ConfigComponentLogger(logger, ComponentName, dscispec)
-	var imageParamMap = map[string]string{
-		"odh-kueue-controller-image": "RELATED_IMAGE_ODH_KUEUE_CONTROLLER_IMAGE", // new kueue image
-	}
-
+	l := logf.FromContext(ctx)
 	enabled := k.GetManagementState() == operatorv1.Managed
 	monitoringEnabled := dscispec.Monitoring.ManagementState == operatorv1.Managed
 	if enabled {
@@ -69,15 +79,10 @@ func (k *Kueue) ReconcileComponent(ctx context.Context, cli client.Client, logge
 				return err
 			}
 		}
-		if (dscispec.DevFlags == nil || dscispec.DevFlags.ManifestsUri == "") && (k.DevFlags == nil || len(k.DevFlags.Manifests) == 0) {
-			if err := deploy.ApplyParams(Path, imageParamMap); err != nil {
-				return fmt.Errorf("failed to update image from %s : %w", Path, err)
-			}
-		}
 	}
 	// Deploy Kueue Operator
 	if err := deploy.DeployManifestsFromPath(ctx, cli, owner, Path, dscispec.ApplicationsNamespace, ComponentName, enabled); err != nil {
-		return fmt.Errorf("failed to apply manifetss %s: %w", Path, err)
+		return fmt.Errorf("failed to apply manifests %s: %w", Path, err)
 	}
 	l.Info("apply manifests done")
 
@@ -88,7 +93,7 @@ func (k *Kueue) ReconcileComponent(ctx context.Context, cli client.Client, logge
 	}
 
 	// CloudService Monitoring handling
-	if platform == cluster.ManagedRhods {
+	if platform == cluster.ManagedRhoai {
 		if err := k.UpdatePrometheusConfig(cli, l, enabled && monitoringEnabled, ComponentName); err != nil {
 			return err
 		}

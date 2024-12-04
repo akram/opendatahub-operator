@@ -3,7 +3,7 @@
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 2.18.0
+VERSION ?= 2.21.0
 # IMAGE_TAG_BASE defines the opendatahub.io namespace and part of the image name for remote images.
 # This variable is used to construct full image tags for bundle and catalog images.
 #
@@ -22,7 +22,8 @@ BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:v$(VERSION)
 IMAGE_BUILDER ?= podman
 OPERATOR_NAMESPACE ?= opendatahub-operator-system
 DEFAULT_MANIFESTS_PATH ?= opt/manifests
-
+CGO_ENABLED ?= 1
+USE_LOCAL = false
 
 CHANNELS="fast"
 # CHANNELS define the bundle channels used in the bundle.
@@ -68,7 +69,7 @@ YQ ?= $(LOCALBIN)/yq
 KUSTOMIZE_VERSION ?= v5.0.2
 CONTROLLER_GEN_VERSION ?= v0.16.1
 OPERATOR_SDK_VERSION ?= v1.31.0
-GOLANGCI_LINT_VERSION ?= v1.60.2
+GOLANGCI_LINT_VERSION ?= v1.61.0
 YQ_VERSION ?= v4.12.2
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.31.0
@@ -93,7 +94,8 @@ E2E_TEST_FLAGS = "--skip-deletion=false" -timeout 25m # See README.md, default g
 # Default image-build is to not use local odh-manifests folder
 # set to "true" to use local instead
 # see target "image-build"
-IMAGE_BUILD_FLAGS ?= --build-arg USE_LOCAL=false
+IMAGE_BUILD_FLAGS ?= --build-arg USE_LOCAL=$(USE_LOCAL)
+IMAGE_BUILD_FLAGS += --build-arg CGO_ENABLED=$(CGO_ENABLED)
 
 # Read any custom variables overrides from a local.mk file.  This will only be read if it exists in the
 # same directory as this Makefile.  Variables can be specified in the standard format supported by
@@ -180,9 +182,15 @@ api-docs: crd-ref-docs ## Creates API docs using https://github.com/elastic/crd-
 build: generate fmt vet ## Build manager binary.
 	go build -o bin/manager main.go
 
+RUN_ARGS = --log-mode=devel
+GO_RUN_MAIN = OPERATOR_NAMESPACE=$(OPERATOR_NAMESPACE) DEFAULT_MANIFESTS_PATH=$(DEFAULT_MANIFESTS_PATH) go run $(GO_RUN_ARGS) ./main.go $(RUN_ARGS)
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	OPERATOR_NAMESPACE=$(OPERATOR_NAMESPACE) DEFAULT_MANIFESTS_PATH=${DEFAULT_MANIFESTS_PATH} go run ./main.go --log-mode=devel
+	$(GO_RUN_MAIN)
+
+.PHONY: run-nowebhook
+run-nowebhook: GO_RUN_ARGS += -tags nowebhook
+run-nowebhook: run ## Run a controller from your host without webhook enabled
 
 .PHONY: image-build
 image-build: # unit-test ## Build image with the manager.
@@ -281,6 +289,7 @@ bundle: prepare operator-sdk ## Generate bundle manifests and metadata, then val
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
 	$(OPERATOR_SDK) bundle validate ./$(BUNDLE_DIR)
 	mv bundle.Dockerfile Dockerfiles/
+	rm -f bundle/manifests/opendatahub-operator-webhook-service_v1_service.yaml
 
 .PHONY: bundle-build
 bundle-build: bundle
@@ -372,6 +381,7 @@ CLEANFILES += cover.out
 e2e-test: ## Run e2e tests for the controller
 	go test ./tests/e2e/ -run ^TestOdhOperator -v --operator-namespace=${OPERATOR_NAMESPACE} ${E2E_TEST_FLAGS}
 
+.PHONY: clean
 clean: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) cache clean
 	chmod u+w -R $(LOCALBIN) # envtest makes its dir RO

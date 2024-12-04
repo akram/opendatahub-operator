@@ -15,6 +15,7 @@ import (
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	dsciv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/dscinitialization/v1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/components"
@@ -31,6 +32,7 @@ var (
 	PathSelfDownstream      = PathDownstream + "/onprem"
 	PathManagedDownstream   = PathDownstream + "/addon"
 	OverridePath            = ""
+	DefaultPath             = ""
 )
 
 // Verifies that Dashboard implements ComponentInterface.
@@ -40,6 +42,26 @@ var _ components.ComponentInterface = (*Dashboard)(nil)
 // +kubebuilder:object:generate=true
 type Dashboard struct {
 	components.Component `json:""`
+}
+
+func (d *Dashboard) Init(ctx context.Context, platform cluster.Platform) error {
+	log := logf.FromContext(ctx).WithName(ComponentNameUpstream)
+
+	imageParamMap := map[string]string{
+		"odh-dashboard-image": "RELATED_IMAGE_ODH_DASHBOARD_IMAGE",
+	}
+	DefaultPath = map[cluster.Platform]string{
+		cluster.SelfManagedRhoai: PathDownstream + "/onprem",
+		cluster.ManagedRhoai:     PathDownstream + "/addon",
+		cluster.OpenDataHub:      PathUpstream,
+		cluster.Unknown:          PathUpstream,
+	}[platform]
+
+	if err := deploy.ApplyParams(DefaultPath, imageParamMap); err != nil {
+		log.Error(err, "failed to update image", "path", DefaultPath)
+	}
+
+	return nil
 }
 
 func (d *Dashboard) OverrideManifests(ctx context.Context, platform cluster.Platform) error {
@@ -62,30 +84,15 @@ func (d *Dashboard) GetComponentName() string {
 
 func (d *Dashboard) ReconcileComponent(ctx context.Context,
 	cli client.Client,
-	logger logr.Logger,
 	owner metav1.Object,
 	dscispec *dsciv1.DSCInitializationSpec,
 	platform cluster.Platform,
 	currentComponentExist bool,
 ) error {
-	var l logr.Logger
-
-	if platform == cluster.SelfManagedRhods || platform == cluster.ManagedRhods {
-		l = d.ConfigComponentLogger(logger, ComponentNameDownstream, dscispec)
-	} else {
-		l = d.ConfigComponentLogger(logger, ComponentNameUpstream, dscispec)
-	}
-
-	entryPath := map[cluster.Platform]string{
-		cluster.SelfManagedRhods: PathDownstream + "/onprem",
-		cluster.ManagedRhods:     PathDownstream + "/addon",
-		cluster.OpenDataHub:      PathUpstream,
-		cluster.Unknown:          PathUpstream,
-	}[platform]
-
+	entryPath := DefaultPath
+	l := logf.FromContext(ctx)
 	enabled := d.GetManagementState() == operatorv1.Managed
 	monitoringEnabled := dscispec.Monitoring.ManagementState == operatorv1.Managed
-	imageParamMap := make(map[string]string)
 
 	if enabled {
 		// 1. cleanup OAuth client related secret and CR if dashboard is in 'installed false' status
@@ -100,8 +107,6 @@ func (d *Dashboard) ReconcileComponent(ctx context.Context,
 			if OverridePath != "" {
 				entryPath = OverridePath
 			}
-		} else { // Update image parameters if devFlags is not provided
-			imageParamMap["odh-dashboard-image"] = "RELATED_IMAGE_ODH_DASHBOARD_IMAGE"
 		}
 
 		// 2. platform specific RBAC
@@ -122,7 +127,7 @@ func (d *Dashboard) ReconcileComponent(ctx context.Context,
 		}
 
 		// 4. update params.env regardless devFlags is provided of not
-		if err := deploy.ApplyParams(entryPath, imageParamMap, extraParamsMap); err != nil {
+		if err := deploy.ApplyParams(entryPath, nil, extraParamsMap); err != nil {
 			return fmt.Errorf("failed to update params.env  from %s : %w", entryPath, err)
 		}
 	}
@@ -130,7 +135,7 @@ func (d *Dashboard) ReconcileComponent(ctx context.Context,
 	// common: Deploy odh-dashboard manifests
 	// TODO: check if we can have the same component name odh-dashboard for both, or still keep rhods-dashboard for RHOAI
 	switch platform {
-	case cluster.SelfManagedRhods, cluster.ManagedRhods:
+	case cluster.SelfManagedRhoai, cluster.ManagedRhoai:
 		// anaconda
 		if err := cluster.CreateSecret(ctx, cli, "anaconda-ce-access", dscispec.ApplicationsNamespace); err != nil {
 			return fmt.Errorf("failed to create access-secret for anaconda: %w", err)
@@ -148,7 +153,7 @@ func (d *Dashboard) ReconcileComponent(ctx context.Context,
 		}
 
 		// CloudService Monitoring handling
-		if platform == cluster.ManagedRhods {
+		if platform == cluster.ManagedRhoai {
 			if err := d.UpdatePrometheusConfig(cli, l, enabled && monitoringEnabled, ComponentNameDownstream); err != nil {
 				return err
 			}
@@ -180,15 +185,15 @@ func (d *Dashboard) ReconcileComponent(ctx context.Context,
 
 func updateKustomizeVariable(ctx context.Context, cli client.Client, platform cluster.Platform, dscispec *dsciv1.DSCInitializationSpec) (map[string]string, error) {
 	adminGroups := map[cluster.Platform]string{
-		cluster.SelfManagedRhods: "rhods-admins",
-		cluster.ManagedRhods:     "dedicated-admins",
+		cluster.SelfManagedRhoai: "rhods-admins",
+		cluster.ManagedRhoai:     "dedicated-admins",
 		cluster.OpenDataHub:      "odh-admins",
 		cluster.Unknown:          "odh-admins",
 	}[platform]
 
 	sectionTitle := map[cluster.Platform]string{
-		cluster.SelfManagedRhods: "OpenShift Self Managed Services",
-		cluster.ManagedRhods:     "OpenShift Managed Services",
+		cluster.SelfManagedRhoai: "OpenShift Self Managed Services",
+		cluster.ManagedRhoai:     "OpenShift Managed Services",
 		cluster.OpenDataHub:      "OpenShift Open Data Hub",
 		cluster.Unknown:          "OpenShift Open Data Hub",
 	}[platform]
@@ -198,8 +203,8 @@ func updateKustomizeVariable(ctx context.Context, cli client.Client, platform cl
 		return nil, fmt.Errorf("error getting console route URL %s : %w", consoleLinkDomain, err)
 	}
 	consoleURL := map[cluster.Platform]string{
-		cluster.SelfManagedRhods: "https://rhods-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
-		cluster.ManagedRhods:     "https://rhods-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
+		cluster.SelfManagedRhoai: "https://rhods-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
+		cluster.ManagedRhoai:     "https://rhods-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
 		cluster.OpenDataHub:      "https://odh-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
 		cluster.Unknown:          "https://odh-dashboard-" + dscispec.ApplicationsNamespace + "." + consoleLinkDomain,
 	}[platform]

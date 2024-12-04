@@ -21,9 +21,11 @@ import (
 	"flag"
 	"os"
 
+	"github.com/hashicorp/go-multierror"
 	addonv1alpha1 "github.com/openshift/addon-operator/apis/addons/v1alpha1"
 	ocappsv1 "github.com/openshift/api/apps/v1" //nolint:importas //reason: conflicts with appsv1 "k8s.io/api/apps/v1"
 	buildv1 "github.com/openshift/api/build/v1"
+	configv1 "github.com/openshift/api/config/v1"
 	imagev1 "github.com/openshift/api/image/v1"
 	oauthv1 "github.com/openshift/api/oauth/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -49,10 +51,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	dscv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/datasciencecluster/v1"
 	dsciv1 "github.com/opendatahub-io/opendatahub-operator/v2/apis/dscinitialization/v1"
@@ -98,7 +101,23 @@ func init() { //nolint:gochecknoinits
 	utilruntime.Must(admissionregistrationv1.AddToScheme(scheme))
 	utilruntime.Must(apiregistrationv1.AddToScheme(scheme))
 	utilruntime.Must(monitoringv1.AddToScheme(scheme))
-	utilruntime.Must(operatorv1.Install(scheme))
+	utilruntime.Must(operatorv1.Install(scheme)) // here also add configv1.Install(scheme) no need add configv1 explicitly
+}
+
+func initComponents(ctx context.Context, p cluster.Platform) error {
+	var errs *multierror.Error
+	var dummyDSC = &dscv1.DataScienceCluster{}
+
+	components, err := dummyDSC.GetComponents()
+	if err != nil {
+		return err
+	}
+
+	for _, c := range components {
+		errs = multierror.Append(errs, c.Init(ctx, p))
+	}
+
+	return errs.ErrorOrNil()
 }
 
 func main() { //nolint:funlen,maintidx
@@ -122,12 +141,16 @@ func main() { //nolint:funlen,maintidx
 	flag.StringVar(&operatorName, "operator-name", "opendatahub", "The name of the operator")
 	flag.StringVar(&logmode, "log-mode", "", "Log mode ('', prod, devel), default to ''")
 
+	opts := zap.Options{}
+	opts.BindFlags(flag.CommandLine)
+
 	flag.Parse()
 
-	ctrl.SetLogger(logger.ConfigLoggers(logmode))
+	ctrl.SetLogger(logger.NewLogger(logmode, &opts))
 
 	// root context
 	ctx := ctrl.SetupSignalHandler()
+	ctx = logf.IntoContext(ctx, setupLog)
 	// Create new uncached client to run initial setup
 	setupCfg, err := config.GetConfig()
 	if err != nil {
@@ -143,12 +166,16 @@ func main() { //nolint:funlen,maintidx
 		setupLog.Error(err, "error getting client for setup")
 		os.Exit(1)
 	}
-	// Get operator platform
-	platform, err := cluster.GetPlatform(ctx, setupClient)
+
+	err = cluster.Init(ctx, setupClient)
 	if err != nil {
-		setupLog.Error(err, "error getting platform")
+		setupLog.Error(err, "unable to initialize cluster config")
 		os.Exit(1)
 	}
+
+	// Get operator platform
+	release := cluster.GetRelease()
+	platform := release.Name
 
 	secretCache := createSecretCacheConfig(platform)
 	deploymentCache := createDeploymentCacheConfig(platform)
@@ -174,6 +201,10 @@ func main() { //nolint:funlen,maintidx
 			// For domain to get OpenshiftIngress and default cert
 			&operatorv1.IngressController{}: {
 				Field: fields.Set{"metadata.name": "default"}.AsSelector(),
+			},
+			// For authentication CR "cluster"
+			&configv1.Authentication{}: {
+				Field: fields.Set{"metadata.name": cluster.ClusterAuthenticationObj}.AsSelector(),
 			},
 			// for prometheus and black-box deployment and ones we owns
 			&appsv1.Deployment{}: {Namespaces: deploymentCache},
@@ -208,20 +239,11 @@ func main() { //nolint:funlen,maintidx
 		os.Exit(1)
 	}
 
-	(&webhook.OpenDataHubValidatingWebhook{
-		Client:  mgr.GetClient(),
-		Decoder: admission.NewDecoder(mgr.GetScheme()),
-	}).SetupWithManager(mgr)
-
-	(&webhook.OpenDataHubMutatingWebhook{
-		Client:  mgr.GetClient(),
-		Decoder: admission.NewDecoder(mgr.GetScheme()),
-	}).SetupWithManager(mgr)
+	webhook.Init(mgr)
 
 	if err = (&dscictrl.DSCInitializationReconciler{
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
-		Log:                   logger.LogWithLevel(ctrl.Log.WithName(operatorName).WithName("controllers").WithName("DSCInitialization"), logmode),
 		Recorder:              mgr.GetEventRecorderFor("dscinitialization-controller"),
 		ApplicationsNamespace: dscApplicationsNamespace,
 	}).SetupWithManager(ctx, mgr); err != nil {
@@ -232,7 +254,6 @@ func main() { //nolint:funlen,maintidx
 	if err = (&dscctrl.DataScienceClusterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Log:    logger.LogWithLevel(ctrl.Log.WithName(operatorName).WithName("controllers").WithName("DataScienceCluster"), logmode),
 		DataScienceCluster: &dscctrl.DataScienceClusterConfig{
 			DSCISpec: &dsciv1.DSCInitializationSpec{
 				ApplicationsNamespace: dscApplicationsNamespace,
@@ -247,8 +268,7 @@ func main() { //nolint:funlen,maintidx
 	if err = (&secretgenerator.SecretGeneratorReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Log:    logger.LogWithLevel(ctrl.Log.WithName(operatorName).WithName("controllers").WithName("SecretGenerator"), logmode),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SecretGenerator")
 		os.Exit(1)
 	}
@@ -256,8 +276,7 @@ func main() { //nolint:funlen,maintidx
 	if err = (&certconfigmapgenerator.CertConfigmapGeneratorReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Log:    logger.LogWithLevel(ctrl.Log.WithName(operatorName).WithName("controllers").WithName("CertConfigmapGenerator"), logmode),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertConfigmapGenerator")
 		os.Exit(1)
 	}
@@ -284,8 +303,8 @@ func main() { //nolint:funlen,maintidx
 		}
 	}
 
-	// Create default DSC CR for managed RHODS
-	if platform == cluster.ManagedRhods {
+	// Create default DSC CR for managed RHOAI
+	if platform == cluster.ManagedRhoai {
 		var createDefaultDSCFunc manager.RunnableFunc = func(ctx context.Context) error {
 			err := upgrade.CreateDefaultDSC(ctx, setupClient)
 			if err != nil {
@@ -320,6 +339,10 @@ func main() { //nolint:funlen,maintidx
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
+	if err := initComponents(ctx, platform); err != nil {
+		setupLog.Error(err, "unable to init components")
+		os.Exit(1)
+	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
@@ -334,10 +357,15 @@ func createSecretCacheConfig(platform cluster.Platform) map[string]cache.Config 
 		"openshift-ingress": {},
 	}
 	switch platform {
-	case cluster.ManagedRhods:
+	case cluster.ManagedRhoai:
 		namespaceConfigs["redhat-ods-monitoring"] = cache.Config{}
 		namespaceConfigs["redhat-ods-applications"] = cache.Config{}
-	case cluster.SelfManagedRhods:
+		operatorNs, err := cluster.GetOperatorNamespace()
+		if err != nil {
+			operatorNs = "redhat-ods-operator" // fall back case
+		}
+		namespaceConfigs[operatorNs] = cache.Config{}
+	case cluster.SelfManagedRhoai:
 		namespaceConfigs["redhat-ods-applications"] = cache.Config{}
 	default:
 		namespaceConfigs["opendatahub"] = cache.Config{}
@@ -348,10 +376,10 @@ func createSecretCacheConfig(platform cluster.Platform) map[string]cache.Config 
 func createDeploymentCacheConfig(platform cluster.Platform) map[string]cache.Config {
 	namespaceConfigs := map[string]cache.Config{}
 	switch platform {
-	case cluster.ManagedRhods: // no need workbench NS, only SFS no Deployment
+	case cluster.ManagedRhoai: // no need workbench NS, only SFS no Deployment
 		namespaceConfigs["redhat-ods-monitoring"] = cache.Config{}
 		namespaceConfigs["redhat-ods-applications"] = cache.Config{}
-	case cluster.SelfManagedRhods:
+	case cluster.SelfManagedRhoai:
 		namespaceConfigs["redhat-ods-applications"] = cache.Config{}
 	default:
 		namespaceConfigs["opendatahub"] = cache.Config{}

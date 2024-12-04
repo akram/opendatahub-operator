@@ -56,6 +56,8 @@ spec:
                 default: opendatahub
                 description: Namespace for applications to be installed, non-configurable,
                   default to "opendatahub"
+                maxLength: 63
+                pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                 type: string
                 x-kubernetes-validations:
                 - message: ApplicationsNamespace is immutable
@@ -65,13 +67,19 @@ spec:
                   Internal development useful field to test customizations.
                   This is not recommended to be used in production environment.
                 properties:
+                  logLevel:
+                    description: Override Zap log level. Can be "debug", "info", "error"
+                      or a number (more verbose).
+                    type: string
                   logmode:
                     default: production
+                    description: '## DEPRECATED ##: Ignored, use LogLevel instead'
                     enum:
                     - devel
                     - development
                     - prod
                     - production
+                    - default
                     type: string
                   manifestsUri:
                     description: Custom manifests uri for odh-manifests
@@ -95,6 +103,8 @@ spec:
                   namespace:
                     default: opendatahub
                     description: Namespace for monitoring if it is enabled
+                    maxLength: 63
+                    pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                     type: string
                 type: object
               serviceMesh:
@@ -126,6 +136,8 @@ spec:
                         description: |-
                           Namespace where it is deployed. If not provided, the default is to
                           use '-auth-provider' suffix on the ApplicationsNamespace of the DSCI.
+                        maxLength: 63
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                         type: string
                     type: object
                   controlPlane:
@@ -152,6 +164,8 @@ spec:
                         default: istio-system
                         description: Namespace is a namespace where Service Mesh is
                           deployed. Defaults to "istio-system".
+                        maxLength: 63
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                         type: string
                     type: object
                   managementState:
