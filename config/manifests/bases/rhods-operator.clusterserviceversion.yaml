@@ -20,6 +20,7 @@ metadata:
     features.operators.openshift.io/token-auth-azure: "false"
     features.operators.openshift.io/token-auth-gcp: "false"
     olm.skipRange: '>=1.0.0 <2.0.0'
+    operatorframework.io/cluster-monitoring: "true"
     operatorframework.io/initialization-resource: |-
       {
         "apiVersion": "datasciencecluster.opendatahub.io/v1",

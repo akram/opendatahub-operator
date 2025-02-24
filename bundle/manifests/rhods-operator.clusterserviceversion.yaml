@@ -103,7 +103,7 @@ metadata:
     categories: AI/Machine Learning, Big Data
     certified: "False"
     containerImage: REPLACE_IMAGE:latest
-    createdAt: "2024-11-05T15:13:29Z"
+    createdAt: "2025-02-24T17:44:09Z"
     description: Operator for deployment and management of Red Hat OpenShift AI
     features.operators.openshift.io/cnf: "false"
     features.operators.openshift.io/cni: "false"
@@ -116,6 +116,7 @@ metadata:
     features.operators.openshift.io/token-auth-azure: "false"
     features.operators.openshift.io/token-auth-gcp: "false"
     olm.skipRange: '>=1.0.0 <2.0.0'
+    operatorframework.io/cluster-monitoring: "true"
     operatorframework.io/initialization-resource: |-
       {
         "apiVersion": "datasciencecluster.opendatahub.io/v1",
@@ -1173,7 +1174,7 @@ spec:
                       fieldPath: metadata.namespace
                 - name: DEFAULT_MANIFESTS_PATH
                   value: /opt/manifests
-                image: REPLACE_IMAGE:latest
+                image: quay.io/opendatahub/opendatahub-operator:latest
                 imagePullPolicy: Always
                 livenessProbe:
                   httpGet:
